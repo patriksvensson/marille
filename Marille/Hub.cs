@@ -11,10 +11,8 @@ public class Hub {
 	readonly Dictionary<(string Topic, Type Type), CancellationTokenSource> cancellationTokenSources = new();
 	readonly Dictionary<(string Topic, Type type), List<object>> workers = new();
 	
-	public Channel<WorkerError> WorkersExceptions { get; } = Channel.CreateUnbounded<WorkerError> ();
-	
-	void DeliverAtLeastOnce<T> (Channel<Message<T>> channel, IWorker<T> [] workersArray, Message<T> item, TimeSpan? timeout)
-		where T : struct
+	void DeliverAtLeastOnce<T> (string topicName, Channel<Message<T>> channel, Channel<WorkerError> errorChannel, 
+		IWorker<T> [] workersArray, Message<T> item, TimeSpan? timeout) where T : struct
 	{
 		Parallel.ForEach (workersArray, worker => {
 			CancellationToken token = default;
@@ -23,19 +21,21 @@ public class Hub {
 				cts.CancelAfter (timeout.Value);
 				token = cts.Token;
 			}
-			_ = worker.ConsumeAsync (item.Payload, token)
-				.ContinueWith ((t) => { channel.Writer.WriteAsync (item); }, TaskContinuationOptions.OnlyOnCanceled) // TODO: max retries
-				.ContinueWith ((t) => WorkersExceptions.Writer.WriteAsync (new(typeof(T), worker, t.Exception)), 
-					TaskContinuationOptions.OnlyOnFaulted);
+
+			var task = _ = worker.ConsumeAsync (item.Payload, token);
+			_ = task.ContinueWith (
+				(t) => errorChannel.Writer.WriteAsync (new(topicName, typeof (T), worker, t.Exception)),
+				TaskContinuationOptions.OnlyOnFaulted);
+			_ = task.ContinueWith ((t) => { channel.Writer.WriteAsync (item); },
+				TaskContinuationOptions.OnlyOnCanceled); // TODO: max retries
 		});
 	}
 
-	Task<ValueTask> DeliverAtMostOnce<T> (Channel<Message<T>> ch, IWorker<T> [] workersArray, Message<T> item, TimeSpan? timeout)
+	Task DeliverAtMostOnce<T> (string topicName, Channel<Message<T>> ch, IWorker<T> worker, Message<T> item, TimeSpan? timeout)
 		where T : struct
 	{
 		// we do know we are not empty, and in the AtMostOnce mode we will only use the first worker
 		// present
-		var worker = workersArray [0];
 		CancellationToken token = default;
 		if (timeout.HasValue) {
 			var cts = new CancellationTokenSource ();
@@ -43,18 +43,17 @@ public class Hub {
 			token = cts.Token;
 		}
 
-		var task = worker.ConsumeAsync (item.Payload, token)
-			.ContinueWith ((t) => { ch.Writer.WriteAsync (item); },
-				TaskContinuationOptions.OnlyOnCanceled) // TODO: max retries
-			.ContinueWith (
-				(t) => WorkersExceptions.Writer.WriteAsync (new(typeof (T), worker,
-					t.Exception)),
-				TaskContinuationOptions.OnlyOnFaulted);
-		return task;
+		return worker.ConsumeAsync (item.Payload, token);
 	}
 
-	async Task ConsumeChannel<T> (TopicConfiguration configuration, Channel<Message<T>> ch, IWorker<T>[] workersArray, 
-		TaskCompletionSource<bool> completionSource, CancellationToken cancellationToken) where T : struct
+	Task ConsumeErrors (TaskCompletionSource<bool> completionSource)
+	{
+		return Task.FromResult (true);
+	}
+
+	async Task ConsumeChannel<T> (string topicName, TopicConfiguration configuration, Channel<Message<T>> ch, 
+		Channel<WorkerError> errorChannel, IWorker<T>[] workersArray, TaskCompletionSource<bool> completionSource, 
+		CancellationToken cancellationToken) where T : struct
 	{
 		// this is an important check, else the items will be consumer with no worker to receive them
 		if (workersArray.Length == 0) {
@@ -72,22 +71,40 @@ public class Hub {
 					continue;
 				switch (configuration.Mode) {
 				case ChannelDeliveryMode.AtLeastOnce:
-					DeliverAtLeastOnce (ch, workersArray, item, configuration.Timeout);
+					DeliverAtLeastOnce (topicName, ch, errorChannel, workersArray, item, configuration.Timeout);
 					break;
 				case ChannelDeliveryMode.AtMostOnceAsync:
-					_ = DeliverAtMostOnce (ch, workersArray, item, configuration.Timeout);
+					var task = DeliverAtMostOnce (topicName, ch, workersArray[0], item, configuration.Timeout);
+					_ = task.ContinueWith (
+						(t) => {
+							return errorChannel.Writer.WriteAsync (new(topicName, typeof (T), workersArray [0],
+								t.Exception));
+						}, TaskContinuationOptions.OnlyOnFaulted);
+
+					// TODO: max retries
+					_ = task.ContinueWith ((t) => { ch.Writer.WriteAsync (item); },
+						TaskContinuationOptions.OnlyOnCanceled);
 					break;
 				case ChannelDeliveryMode.AtMostOnceSync:
 					// make the call 'sync' by not processing an item until we are done with the current one
-					await DeliverAtMostOnce (ch, workersArray, item, configuration.Timeout);
+					try {
+						await DeliverAtMostOnce (topicName, ch, workersArray [0], item, configuration.Timeout);
+					} catch (OperationCanceledException) {
+						// handle retries properly by looking at the message metadata
+						await ch.Writer.WriteAsync (item);
+					} catch (Exception ex){
+						// write the error in the error channel
+						await errorChannel.Writer.WriteAsync (new(topicName, typeof (T), workersArray [0], ex));
+					}
+
 					break;
 				}
 			}
 		}
 	}
 	
-	Task<bool> StartConsuming<T> (string topicName, TopicConfiguration configuration, Channel<Message<T>> channel)
-		where T : struct
+	Task<bool> StartConsuming<T> (string topicName, TopicConfiguration configuration, 
+		Channel<Message<T>> channel, Channel<WorkerError> errorChannel) where T : struct
 	{
 		Type type = typeof (T);
 		// we want to be able to cancel the thread that we are using to consume the
@@ -103,7 +120,7 @@ public class Hub {
 		// we have no interest in awaiting for this task, but we want to make sure it started. To do so
 		// we create a TaskCompletionSource that will be set when the consume channel method is ready to consume
 		var completionSource = new TaskCompletionSource<bool>();
-		_ = ConsumeChannel (configuration, channel, workersCopy, completionSource, cancellationToken.Token);
+		_ = ConsumeChannel (topicName, configuration, channel, errorChannel, workersCopy, completionSource, cancellationToken.Token);
 		// send a message with a ack so that we can ensure we are indeed running
 		_ = channel.Writer.WriteAsync (new Message<T> (MessageType.Ack));
 		return completionSource.Task;
@@ -165,8 +182,8 @@ public class Hub {
 		if (topic.TryGetChannel<T> (out _)) {
 			return false;
 		}
-		var ch = topic.CreateChannel<T> (configuration);
-		await StartConsuming (topicName, configuration, ch);
+		var (ch, errorCh) = topic.CreateChannel<T> (configuration);
+		await StartConsuming (topicName, configuration, ch, errorCh);
 		return true;
 	}
 
@@ -182,8 +199,8 @@ public class Hub {
 	/// <param name="initialWorkers">Original set of IWorker&lt;T&gt; to be assigned the channel on creation.</param>
 	/// <typeparam name="T">The event type to be used for the channel.</typeparam>
 	/// <returns>true when the channel was created.</returns>
-	public Task<bool> CreateAsync<T> (string topicName, TopicConfiguration configuration,
-		IEnumerable<IWorker<T>> initialWorkers) where T : struct
+	public Task<bool> CreateAsync<T> (string topicName, TopicConfiguration configuration, 
+		IWorker<WorkerError> errorHandler, IEnumerable<IWorker<T>> initialWorkers) where T : struct
 		=> CreateAsync (topicName, configuration, initialWorkers.ToArray ());
 
 	/// <summary>
@@ -243,18 +260,25 @@ public class Hub {
 		var type = typeof (T);
 		// we only allow the client to register to an existing topic
 		// in this API we will not create it, there are other APIs for that
-		if (!TryGetChannel<T> (topicName, out var ch))
+		if (!TryGetChannel<T> (topicName, out var topicInfo))
 			return Task.FromResult(false);
 
 		// do not allow to add more than one worker ig we are in AtMostOnce mode.
-		if (ch.Configuration.Mode == ChannelDeliveryMode.AtMostOnceAsync && workers [(topicName, type)].Count >= 1)
+		if (topicInfo.Configuration.Mode == ChannelDeliveryMode.AtMostOnceAsync 
+		    && workers [(topicName, type)].Count >= 1)
 			return Task.FromResult (false);
 
 		// we will have to stop consuming while we add the new worker
 		// but we do not need to close the channel, the API will buffer
 		StopConsuming<T> (topicName);
 		workers [(topicName, type)].AddRange (newWorkers);
-		return StartConsuming (topicName, ch.Configuration, ch.Channel);
+		return StartConsuming (topicName, topicInfo.Configuration, topicInfo.Channel, topicInfo.ErrorChannel);
+	}
+
+	public Task<bool> RegisterToErrorsAsync<T> (string topicName, params IWorker<WorkerError> [] newWorkers)
+		where T : struct
+	{
+		return Task.FromResult (true);
 	}
 
 	/// <summary>
@@ -269,6 +293,10 @@ public class Hub {
 	/// messages while this operation takes place because messages will be buffered by the channel.</remarks>
 	public Task<bool> RegisterAsync<T> (string topicName, Func<T, CancellationToken, Task> action)  where T : struct
 		=> RegisterAsync (topicName, new LambdaWorker<T> (action));
+
+	public Task<bool> RegisterToErrorsAsync<T> (string topicName, Func<WorkerError, CancellationToken, Task> action)
+		where T : struct
+		=> RegisterToErrorsAsync<T> (topicName, new LambdaWorker<WorkerError> (action));
 
 	/// <summary>
 	/// Allows to publish a message in a given topic. The message will be added to a channel and will be

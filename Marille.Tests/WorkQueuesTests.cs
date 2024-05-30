@@ -15,14 +15,6 @@ public class WorkQueuesTests {
 		}
 	}
 	
-	class ExceptionWorker : IWorker<WorkQueuesEvent> {
-		public string Id { get; set; } = string.Empty;
-		public Task ConsumeAsync (WorkQueuesEvent message, CancellationToken cancellationToken = default)
-		{
-			throw new NotImplementedException ();
-		}
-	}
-
 	Hub _hub;
 	TopicConfiguration configuration;
 	readonly CancellationTokenSource cancellationTokenSource;
@@ -52,6 +44,25 @@ public class WorkQueuesTests {
 		await _hub.RegisterAsync (topic, worker);
 		await _hub.Publish (topic, new WorkQueuesEvent ("myID"));
 		Assert.True (await tcs.Task);
+	}
+	
+	[Theory]
+	[InlineData(ChannelDeliveryMode.AtMostOnceAsync)]
+	[InlineData(ChannelDeliveryMode.AtMostOnceSync)]
+	public async void SingleWorkerException (ChannelDeliveryMode deliveryMode)
+	{
+		configuration.Mode = deliveryMode;
+		var topic = "topic";
+		var worker = new ExceptionWorker ("myWorkerID");
+		await _hub.CreateAsync<WorkQueuesEvent> (topic, configuration);
+		await _hub.RegisterAsync (topic, worker);
+		await _hub.Publish (topic, new WorkQueuesEvent ("myID"));
+		// at this point we should be getting an exception from the exceptions channel
+		var error = await _hub.WorkersExceptions.Reader.ReadAsync ();
+		// assert that the error comes from our worker and for the appropiate topic
+		Assert.Equal (topic, error.TopicName);
+		Assert.Same (worker, error.Worker);
+		Assert.NotNull (error.WorkerException);
 	}
 
 	[Theory]

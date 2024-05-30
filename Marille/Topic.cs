@@ -4,7 +4,7 @@ using System.Threading.Channels;
 namespace Marille;
 
 internal class Topic (string name) {
-	readonly Dictionary<Type, (TopicConfiguration Configuration, object Channel)> channels = new();
+	readonly Dictionary<Type, (TopicConfiguration Configuration, object Channel, Channel<WorkerError> ErrorChannel)> channels = new();
 
 	public string Name { get; } = name;
 
@@ -14,21 +14,24 @@ internal class Topic (string name) {
 		channel = null;
 		if (!channels.TryGetValue (type, out var obj)) 
 			return false;
-		channel = new (obj.Configuration, (obj.Channel as Channel<Message<T>>)!);
+		channel = new (obj.Configuration, (obj.Channel as Channel<Message<T>>)!, obj.ErrorChannel);
 		return true;
 	}
 
-	public Channel<Message<T>> CreateChannel<T> (TopicConfiguration configuration) where T : struct
+	public (Channel<Message<T>> Channel, Channel<WorkerError> ErrorChannel) CreateChannel<T> (TopicConfiguration configuration) where T : struct
 	{
 		Type type = typeof (T);
 		if (!channels.TryGetValue (type, out var obj)) {
 			var ch = (configuration.Capacity is null) ? 
 				Channel.CreateUnbounded<Message<T>> () : Channel.CreateBounded<Message<T>> (configuration.Capacity.Value);
-			obj = new (configuration, ch);
+			// error channels will be unbounded by default since we do not know how many errors we are 
+			// going to get
+			var errorCh = Channel.CreateUnbounded<WorkerError> ();
+			obj = new (configuration, ch, errorCh);
 			channels[type] = obj; 
 		}
 
-		return (obj.Channel as Channel<Message<T>>)!;
+		return (obj.Channel as Channel<Message<T>>, obj.ErrorChannel)!;
 	}
 
 	public void CloseChannel<T> () where T : struct
